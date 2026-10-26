@@ -5,11 +5,16 @@
 //   payload = u8 op (1 = SET, 2 = DEL) | u32 key_len | key | [u32 value_len | value]   (value only for SET)
 //
 // A crash can leave a partially written last record. Recovery replays records in order and stops at the
-// first one that is short or fails its checksum, then truncates the file there, so the next append starts
-// from a clean boundary. Everything before that point was written in full and is kept.
+// first one that is short or fails its checksum. If nothing valid follows it, that is a torn tail: the file
+// is truncated there. If a valid record DOES follow it, the damage is in the middle of the log, and recovery
+// refuses to start rather than silently deleting the later records.
+//
+// Any failed write, flush or fsync puts the writer into a sticky failed state: every later append throws.
+// Nothing is acknowledged after a write error, and nothing is appended after a possibly torn record.
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -23,8 +28,16 @@
 #include <thread>
 
 #ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <io.h>
+#include <windows.h>
 #else
+#include <fcntl.h>
 #include <unistd.h>
 #endif
 
@@ -32,6 +45,10 @@ namespace kvlog {
 
 enum class Op : std::uint8_t { Set = 1, Del = 2 };
 enum class SyncPolicy { Always, EverySecond, Never };
+
+struct LogFailed : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
 
 // ---------- encoding ----------
 
@@ -116,120 +133,229 @@ struct RecoveryReport {
     std::uintmax_t truncated_bytes = 0;
 };
 
-// Replays the log at `path` through `apply` and truncates any torn or corrupt tail.
-inline RecoveryReport recover(const std::filesystem::path& path, const std::function<void(const Record&)>& apply) {
-    RecoveryReport report;
-    if (!std::filesystem::exists(path)) return report;
+inline std::string read_file(const std::filesystem::path& path) {
     std::string data;
-    {
-        std::FILE* f = std::fopen(path.string().c_str(), "rb");
-        if (!f) throw std::runtime_error("cannot open log for recovery: " + path.string());
-        char buf[1 << 16];
-        std::size_t n;
-        while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) data.append(buf, n);
-        std::fclose(f);
-    }
+    std::FILE* f = std::fopen(path.string().c_str(), "rb");
+    if (!f) throw std::runtime_error("cannot open " + path.string());
+    char buf[1 << 16];
+    std::size_t n;
+    while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) data.append(buf, n);
+    const bool failed = std::ferror(f) != 0;
+    std::fclose(f);
+    if (failed) throw std::runtime_error("read error on " + path.string() + " (refusing to treat it as a torn tail)");
+    return data;
+}
+
+// Counts valid records without changing anything. `bad_at` is where replay would stop.
+inline RecoveryReport scan(std::string_view data, const std::function<void(const Record&)>& apply = {}) {
+    RecoveryReport r;
     std::size_t at = 0;
-    Record r{};
+    Record rec{};
     while (at < data.size()) {
-        const std::size_t used = decode_record(data, at, r);
+        const std::size_t used = decode_record(data, at, rec);
         if (used == 0) break;
-        apply(r);
+        if (apply) apply(rec);
         at += used;
-        ++report.records;
+        ++r.records;
     }
-    report.valid_bytes = at;
-    report.truncated_bytes = data.size() - at;
-    if (report.truncated_bytes) std::filesystem::resize_file(path, at);
+    r.valid_bytes = at;
+    r.truncated_bytes = data.size() - at;
+    return r;
+}
+
+// True if any complete, checksummed record starts after `from`: the damage is not just a torn tail.
+inline bool valid_record_after(std::string_view data, std::size_t from) {
+    Record rec{};
+    for (std::size_t at = from + 1; at + 8 <= data.size(); ++at) {
+        const std::uint32_t len = get_u32(data, at);
+        if (len < 5 || data.size() - at - 8 < len) continue;  // cheap filter before the checksum
+        if (decode_record(data, at, rec)) return true;
+    }
+    return false;
+}
+
+// Replays the log at `path` through `apply` and truncates a torn tail. Throws on mid-log corruption.
+inline RecoveryReport recover(const std::filesystem::path& path, const std::function<void(const Record&)>& apply) {
+    if (!std::filesystem::exists(path)) return {};
+    const std::string data = read_file(path);
+    const RecoveryReport report = scan(data, apply);
+    if (report.truncated_bytes) {
+        if (valid_record_after(data, report.valid_bytes))
+            throw std::runtime_error("log is corrupt at byte " + std::to_string(report.valid_bytes) +
+                                     " but valid records follow; refusing to truncate. Inspect or move " +
+                                     path.string() + " before restarting.");
+        std::filesystem::resize_file(path, report.valid_bytes);
+    }
     return report;
+}
+
+// ---------- durable file operations ----------
+
+inline bool flush_and_sync(std::FILE* f) {
+    if (std::fflush(f) != 0) return false;
+#ifdef _WIN32
+    return _commit(_fileno(f)) == 0;
+#else
+    return ::fsync(::fileno(f)) == 0;
+#endif
+}
+
+inline bool sync_fd_of(std::FILE* f) {
+#ifdef _WIN32
+    return _commit(_fileno(f)) == 0;
+#else
+    return ::fsync(::fileno(f)) == 0;
+#endif
+}
+
+// Makes a rename or file creation in `dir` survive power loss (POSIX needs the directory fsynced).
+inline void sync_directory(const std::filesystem::path& dir) {
+#ifndef _WIN32
+    const int fd = ::open(dir.empty() ? "." : dir.c_str(), O_RDONLY);
+    if (fd < 0) throw LogFailed("cannot open directory for fsync: " + dir.string());
+    const int rc = ::fsync(fd);
+    ::close(fd);
+    if (rc != 0) throw LogFailed("directory fsync failed: " + dir.string());
+#else
+    (void)dir;  // MoveFileExW with MOVEFILE_WRITE_THROUGH below covers the rename on Windows
+#endif
+}
+
+inline void durable_replace(const std::filesystem::path& from, const std::filesystem::path& to) {
+#ifdef _WIN32
+    if (!MoveFileExW(from.wstring().c_str(), to.wstring().c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        throw std::runtime_error("rename failed: " + from.string() + " -> " + to.string());
+#else
+    std::filesystem::rename(from, to);
+    sync_directory(to.parent_path());
+#endif
 }
 
 // ---------- writer ----------
 
-inline void sync_file(std::FILE* f) {
-    std::fflush(f);
-#ifdef _WIN32
-    _commit(_fileno(f));
-#else
-    ::fsync(::fileno(f));
-#endif
-}
-
 // Thread-safe appender with group commit: under SyncPolicy::Always, a caller waits until an fsync covering
 // its own record has completed, and one fsync covers every record appended before it started.
+//
+// Lock order: sync_mu_ before write_mu_ (and callers' shard locks before write_mu_).
 class LogWriter {
 public:
     LogWriter(std::filesystem::path path, SyncPolicy policy) : path_(std::move(path)), policy_(policy) {
+        const bool created = !std::filesystem::exists(path_);
         open();
+        if (created) sync_directory(path_.parent_path());
         if (policy_ == SyncPolicy::EverySecond) syncer_ = std::thread([this] { sync_loop(); });
     }
     ~LogWriter() {
         {
-            std::lock_guard lk(write_mu_);
+            std::lock_guard lk(stop_mu_);
             stop_ = true;
         }
         stop_cv_.notify_all();
         if (syncer_.joinable()) syncer_.join();
         std::lock_guard lk(write_mu_);
         if (file_) {
-            sync_file(file_);
+            flush_and_sync(file_);
             std::fclose(file_);
         }
     }
     LogWriter(const LogWriter&) = delete;
     LogWriter& operator=(const LogWriter&) = delete;
 
-    // Appends to the OS buffer and returns a sequence number to pass to wait_durable().
+    // Appends to the stdio buffer and returns a sequence number for wait_durable(). Throws once failed.
     std::uint64_t append(std::string_view record) {
         std::lock_guard lk(write_mu_);
-        if (std::fwrite(record.data(), 1, record.size(), file_) != record.size())
-            throw std::runtime_error("log write failed");
+        check_ok();
+        if (std::fwrite(record.data(), 1, record.size(), file_) != record.size()) fail("log write failed");
         return ++written_;
     }
 
-    // Under SyncPolicy::Always, block until record `seq` is on stable storage. Otherwise a no-op.
+    // Hands everything appended so far to the OS (no fsync). The server calls this before sending replies,
+    // so a killed process never loses an acknowledged write, whatever the fsync policy.
+    void flush_to_os() {
+        std::lock_guard lk(write_mu_);
+        check_ok();
+        if (std::fflush(file_) != 0) fail("log flush failed");
+    }
+
+    // Under SyncPolicy::Always, block until record `seq` is on stable storage. Otherwise only flush_to_os().
     void wait_durable(std::uint64_t seq) {
-        if (policy_ != SyncPolicy::Always) return;
+        if (policy_ != SyncPolicy::Always) {
+            flush_to_os();
+            return;
+        }
         std::lock_guard sync_lk(sync_mu_);
+        check_ok();
         if (synced_ >= seq) return;  // someone else's fsync already covered it
         std::uint64_t upto;
         {
             std::lock_guard lk(write_mu_);
-            std::fflush(file_);
+            check_ok();
+            if (std::fflush(file_) != 0) fail("log flush failed");
             upto = written_;
         }
-        // fsync without holding write_mu_, so other writers keep appending while the disk works.
-#ifdef _WIN32
-        _commit(_fileno(file_));
-#else
-        ::fsync(::fileno(file_));
-#endif
+        // fsync without write_mu_, so other writers keep appending while the disk works. file_ only changes
+        // in rewrite(), which needs sync_mu_ (held here).
+        if (!sync_fd_of(file_)) {
+            std::lock_guard lk(write_mu_);
+            fail("log fsync failed");
+        }
         synced_ = upto;
         ++fsyncs_;
     }
 
-    // Rewrites the log as `snapshot` (records produced by the caller), atomically replacing the old file.
+    // Rewrites the log as `snapshot` (records produced by the caller), then atomically replaces the old file.
     // The caller must stop all writers first (the store holds every shard lock while this runs).
+    // On any error the old log stays in place and in use, and the error is thrown.
     void rewrite(const std::function<void(const std::function<void(std::string_view)>&)>& snapshot) {
         std::lock_guard sync_lk(sync_mu_);
         std::lock_guard lk(write_mu_);
+        check_ok();
         const auto tmp = std::filesystem::path(path_).concat(".rewrite");
-        std::FILE* out = std::fopen(tmp.string().c_str(), "wb");
-        if (!out) throw std::runtime_error("cannot create " + tmp.string());
-        snapshot([&](std::string_view rec) {
-            if (std::fwrite(rec.data(), 1, rec.size(), out) != rec.size()) throw std::runtime_error("rewrite failed");
-        });
-        sync_file(out);
-        std::fclose(out);
-        sync_file(file_);
-        std::fclose(file_);
+        std::size_t emitted = 0;
+        {
+            std::FILE* out = std::fopen(tmp.string().c_str(), "wb");
+            if (!out) throw std::runtime_error("cannot create " + tmp.string());
+            bool ok = true;
+            try {
+                snapshot([&](std::string_view rec) {
+                    if (std::fwrite(rec.data(), 1, rec.size(), out) != rec.size()) throw std::runtime_error("rewrite write failed");
+                    ++emitted;
+                });
+                ok = flush_and_sync(out);
+            } catch (...) {
+                std::fclose(out);
+                std::filesystem::remove(tmp);
+                throw;
+            }
+            if (std::fclose(out) != 0) ok = false;
+            if (!ok) {
+                std::filesystem::remove(tmp);
+                throw std::runtime_error("rewrite flush/fsync failed; old log kept");
+            }
+        }
+        // Read the new file back: it must decode completely, with every record we wrote.
+        const RecoveryReport check = scan(read_file(tmp));
+        if (check.truncated_bytes != 0 || check.records != emitted) {
+            std::filesystem::remove(tmp);
+            throw std::runtime_error("rewrite verification failed; old log kept");
+        }
+        if (!flush_and_sync(file_)) fail("log fsync failed before rewrite");
+        std::fclose(file_);  // Windows cannot replace a file that is open
         file_ = nullptr;
-        std::filesystem::rename(tmp, path_);  // atomic replace; a crash before this keeps the old, complete log
+        try {
+            durable_replace(tmp, path_);
+        } catch (...) {
+            open();  // the old, complete log is still at path_; keep using it
+            std::filesystem::remove(tmp);
+            throw;
+        }
         open();
         synced_ = written_;
     }
 
-    std::uint64_t fsyncs() const { return fsyncs_; }
+    std::uint64_t fsyncs() const { return fsyncs_.load(); }
+    bool failed() const { return failed_.load(); }
+
     // Bytes written so far, including any still in the stdio buffer (flushed first).
     std::uintmax_t size() {
         std::lock_guard lk(write_mu_);
@@ -240,15 +366,36 @@ public:
 private:
     void open() {
         file_ = std::fopen(path_.string().c_str(), "ab");
-        if (!file_) throw std::runtime_error("cannot open log " + path_.string());
+        if (!file_) {
+            failed_ = true;
+            throw LogFailed("cannot open log " + path_.string());
+        }
         std::setvbuf(file_, nullptr, _IOFBF, 1 << 16);
     }
 
+    // Caller holds write_mu_.
+    void check_ok() const {
+        if (failed_) throw LogFailed("log is in a failed state after an earlier write error; writes are disabled");
+    }
+    [[noreturn]] void fail(const char* what) {
+        failed_ = true;
+        throw LogFailed(what);
+    }
+
     void sync_loop() {
-        std::unique_lock lk(write_mu_);
-        while (!stop_) {
-            stop_cv_.wait_for(lk, std::chrono::seconds(1), [this] { return stop_; });
-            if (file_) sync_file(file_);
+        for (;;) {
+            {
+                std::unique_lock lk(stop_mu_);
+                if (stop_cv_.wait_for(lk, std::chrono::seconds(1), [this] { return stop_; })) return;
+            }
+            // Flush under write_mu_ (fast), fsync under sync_mu_ only, so appends are never blocked by the disk.
+            std::lock_guard sync_lk(sync_mu_);
+            {
+                std::lock_guard lk(write_mu_);
+                if (failed_ || !file_) continue;
+                if (std::fflush(file_) != 0) { failed_ = true; continue; }
+            }
+            if (!sync_fd_of(file_)) failed_ = true;
         }
     }
 
@@ -259,7 +406,9 @@ private:
     std::mutex sync_mu_;
     std::uint64_t written_ = 0;
     std::uint64_t synced_ = 0;
-    std::uint64_t fsyncs_ = 0;
+    std::atomic<std::uint64_t> fsyncs_{0};
+    std::atomic<bool> failed_{false};
+    std::mutex stop_mu_;
     bool stop_ = false;
     std::condition_variable stop_cv_;
     std::thread syncer_;

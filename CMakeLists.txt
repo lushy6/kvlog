@@ -31,3 +31,11 @@ foreach(t test_resp test_log test_store)
   target_link_libraries(${t} PRIVATE kvlog)
   add_test(NAME ${t} COMMAND ${t} WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 endforeach()
+
+# Mutation check, enforced: the same store test compiled with the write-ordering bug deliberately reintroduced
+# (log appended after releasing the shard lock) must FAIL. If it ever passes, test_store has stopped detecting it.
+add_executable(test_store_broken tests/test_store.cpp)
+target_link_libraries(test_store_broken PRIVATE kvlog)
+target_compile_definitions(test_store_broken PRIVATE KVLOG_BROKEN_ORDERING ORDERING_ONLY)
+add_test(NAME test_store_broken_must_fail COMMAND test_store_broken WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+set_tests_properties(test_store_broken_must_fail PROPERTIES WILL_FAIL TRUE)

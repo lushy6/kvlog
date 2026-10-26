@@ -57,19 +57,59 @@ static void a_cut_at_every_offset_recovers_the_complete_prefix() {
     fs::remove(p);
 }
 
-static void a_corrupt_byte_stops_replay_before_it() {
+// Damage in the middle (a valid record follows it) must not be "repaired" by deleting later records.
+static void mid_log_corruption_refuses_to_truncate() {
     const std::string a = encode_record(Op::Set, "a", "1"), b = encode_record(Op::Set, "b", "2"),
                       c = encode_record(Op::Set, "c", "3");
     std::string data = a + b + c;
-    data[a.size() + 10] ^= 0x01;  // flip a bit inside record b's payload
+    data[a.size() + 10] ^= 0x01;  // flip a bit inside record b's payload; c is intact after it
     const fs::path p = "corrupt.aof";
+    write_all(p, data);
+    bool refused = false;
+    try {
+        replay(p);
+    } catch (const std::runtime_error&) {
+        refused = true;
+    }
+    CHECK(refused);
+    CHECK(fs::file_size(p) == data.size());  // nothing deleted
+    fs::remove(p);
+}
+
+// Damage in the last record (nothing valid after it) is a torn tail: truncate it, keep the rest.
+static void corrupt_last_record_is_treated_as_a_torn_tail() {
+    const std::string a = encode_record(Op::Set, "a", "1"), b = encode_record(Op::Set, "b", "2");
+    std::string data = a + b;
+    data[a.size() + 10] ^= 0x01;
+    const fs::path p = "tail.aof";
     write_all(p, data);
     RecoveryReport rep;
     auto m = replay(p, &rep);
     CHECK(rep.records == 1 && m.size() == 1 && m.count("a"));
-    CHECK(fs::file_size(p) == a.size());  // b and everything after it are cut off
+    CHECK(fs::file_size(p) == a.size());
     fs::remove(p);
 }
+
+#ifdef __linux__
+// /dev/full fails every write with ENOSPC: the writer must refuse to acknowledge, then stay failed.
+static void write_errors_are_sticky_and_never_acknowledged() {
+    LogWriter w("/dev/full", SyncPolicy::Always);
+    bool first_failed = false, later_failed = false;
+    try {
+        w.wait_durable(w.append(encode_record(Op::Set, "k", "v")));
+    } catch (const LogFailed&) {
+        first_failed = true;
+    }
+    try {
+        w.append(encode_record(Op::Set, "k2", "v"));
+    } catch (const LogFailed&) {
+        later_failed = true;
+    }
+    CHECK(first_failed);
+    CHECK(later_failed);
+    CHECK(w.failed());
+}
+#endif
 
 static void writer_appends_after_a_truncated_recovery() {
     const fs::path p = "append.aof";
@@ -106,7 +146,11 @@ static void rewrite_replaces_the_log_atomically() {
 int main() {
     records_round_trip();
     a_cut_at_every_offset_recovers_the_complete_prefix();
-    a_corrupt_byte_stops_replay_before_it();
+    mid_log_corruption_refuses_to_truncate();
+    corrupt_last_record_is_treated_as_a_torn_tail();
+#ifdef __linux__
+    write_errors_are_sticky_and_never_acknowledged();
+#endif
     writer_appends_after_a_truncated_recovery();
     rewrite_replaces_the_log_atomically();
     return finish("test_log");

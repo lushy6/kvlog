@@ -19,8 +19,9 @@ run_pair() {  # mode, kvlog args, redis args, requests, set-ratio
   redis-server --port 6391 --dir "$work/redis" --save "" $redis_args --daemonize no >/dev/null & local rd=$!
   wait_port 6390; wait_port 6391
   for p in 1 16; do
-    "$BENCH" --port 6390 --clients "$CLIENTS" --requests "$reqs" --pipeline "$p" --set-ratio "$ratio" --label "kvlog/$mode"
-    "$BENCH" --port 6391 --clients "$CLIENTS" --requests "$reqs" --pipeline "$p" --set-ratio "$ratio" --label "redis/$mode"
+    # A failed run still prints its JSON line (with failures > 0); keep going so the table shows every row.
+    "$BENCH" --port 6390 --clients "$CLIENTS" --requests "$reqs" --pipeline "$p" --set-ratio "$ratio" --label "kvlog/$mode" || true
+    "$BENCH" --port 6391 --clients "$CLIENTS" --requests "$reqs" --pipeline "$p" --set-ratio "$ratio" --label "redis/$mode" || true
   done
   kill "$kv" "$rd"; wait "$kv" "$rd" 2>/dev/null || true
 }

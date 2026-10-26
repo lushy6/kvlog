@@ -123,8 +123,10 @@ static void delete_of_missing_key_writes_nothing() {
 
 int main() {
     replay_reproduces_memory_under_contention(SyncPolicy::Never, 8, 20000, 100);
+#ifndef ORDERING_ONLY
     replay_reproduces_memory_under_contention(SyncPolicy::Always, 8, 300, 10);
     compaction_during_writes_loses_nothing();
     delete_of_missing_key_writes_nothing();
+#endif
     return finish("test_store");
 }

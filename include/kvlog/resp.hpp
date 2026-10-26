@@ -7,6 +7,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace kvlog {
@@ -16,20 +17,31 @@ using Command = std::vector<std::string>;
 class RespParser {
 public:
     static constexpr std::size_t kMaxArgs = 1024;
-    static constexpr std::size_t kMaxBulk = 64u << 20;  // 64 MiB per argument
+    static constexpr std::size_t kMaxBulk = 64u << 20;      // 64 MiB per argument
+    static constexpr std::size_t kMaxBuffered = 256u << 20; // per connection; Redis's equivalent is client-query-buffer-limit
 
-    void feed(std::string_view bytes) { buf_.append(bytes); }
+    void feed(std::string_view bytes) {
+        if (!error_.empty()) return;
+        if (buffered() + bytes.size() > kMaxBuffered) {
+            error_ = "query buffer limit exceeded";
+            return;
+        }
+        buf_.append(bytes);
+    }
 
     // A complete command, or nullopt if more bytes are needed. Sets error() on malformed input;
     // after an error the connection should reply with it and close (the stream cannot be resynchronised).
+    //
+    // Two passes: first find every argument's offset without copying anything, and only when the whole
+    // command is buffered copy the arguments out. A large command arriving in small pieces therefore costs
+    // a header re-scan per read, not a copy of everything received so far.
     std::optional<Command> next() {
         if (!error_.empty()) return std::nullopt;
         std::size_t pos = pos_;
-        Command cmd;
         long long n = 0;
         if (!read_header(pos, '*', n)) return std::nullopt;
         if (n < 1 || static_cast<std::size_t>(n) > kMaxArgs) return fail("invalid multibulk length");
-        cmd.reserve(static_cast<std::size_t>(n));
+        spans_.clear();
         for (long long i = 0; i < n; ++i) {
             long long len = 0;
             if (!read_header(pos, '$', len)) return std::nullopt;
@@ -37,9 +49,12 @@ public:
             const auto ulen = static_cast<std::size_t>(len);
             if (buf_.size() - pos < ulen + 2) return std::nullopt;
             if (buf_[pos + ulen] != '\r' || buf_[pos + ulen + 1] != '\n') return fail("bulk string not terminated by CRLF");
-            cmd.emplace_back(buf_, pos, ulen);
+            spans_.emplace_back(pos, ulen);
             pos += ulen + 2;
         }
+        Command cmd;
+        cmd.reserve(spans_.size());
+        for (auto [at, len] : spans_) cmd.emplace_back(buf_, at, len);
         pos_ = pos;
         if (pos_ > 64 * 1024 && pos_ * 2 > buf_.size()) {  // drop consumed bytes now and then, not on every command
             buf_.erase(0, pos_);
@@ -61,12 +76,12 @@ private:
             if (buf_.size() - pos > 32) fail("header line too long");
             return false;
         }
-        if (eol == pos + 1 || eol - pos > 21) { fail("bad length"); return false; }
-        long long v = 0;
-        bool neg = false;
         std::size_t i = pos + 1;
-        if (buf_[i] == '-') { neg = true; ++i; }
-        if (i == eol) { fail("bad length"); return false; }
+        const bool neg = i < eol && buf_[i] == '-';
+        if (neg) ++i;
+        // At most 18 digits: always fits in long long, so no overflow (lengths are capped far lower anyway).
+        if (i == eol || eol - i > 18) { fail("bad length"); return false; }
+        long long v = 0;
         for (; i < eol; ++i) {
             const char c = buf_[i];
             if (c < '0' || c > '9') { fail("bad length"); return false; }
@@ -85,6 +100,7 @@ private:
     std::string buf_;
     std::size_t pos_ = 0;
     std::string error_;
+    std::vector<std::pair<std::size_t, std::size_t>> spans_;
 };
 
 // ---------- replies ----------

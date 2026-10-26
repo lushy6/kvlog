@@ -33,17 +33,23 @@ jobs:
         run: |
           bin=$(find build -name 'kvlog-server' -o -name 'kvlog-server.exe' | head -1)
           echo "SERVER=$(cd "$(dirname "$bin")" && pwd)/$(basename "$bin")" >> "$GITHUB_ENV"
-      - name: Crash test, fsync=always (must keep every acknowledged write)
+      - name: Crash test, fsync=always, with COMPACT in some rounds (every acknowledged write must survive)
         shell: bash
         run: python scripts/crash_test.py --server "$SERVER" --rounds 20
-      - name: Negative control, fsync=no (must lose acknowledged writes, or the crash test proves nothing)
+      - name: Crash test, fsync=everysec (process kill must not lose acknowledged writes either)
+        shell: bash
+        run: python scripts/crash_test.py --server "$SERVER" --rounds 10 --fsync everysec
+      - name: Negative control (server replies before writing; the test must report data loss, exit 3)
         shell: bash
         run: |
-          if python scripts/crash_test.py --server "$SERVER" --rounds 10 --fsync no; then
-            echo "::error::the crash test passed without durability; it is not detecting data loss"
+          set +e
+          python scripts/crash_test.py --server "$SERVER" --rounds 10 --fsync no --unsafe
+          code=$?
+          if [ "$code" -ne 3 ]; then
+            echo "::error::expected exit 3 (acknowledged writes lost), got $code; the crash test is not detecting loss"
             exit 1
           fi
-          echo "negative control failed as expected"
+          echo "negative control lost data as expected"
 
   bench:
     name: Benchmark vs Redis (same runner, same client)
@@ -57,9 +63,18 @@ jobs:
         run: |
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
           cmake --build build
+      - name: redis-cli works against kvlog
+        run: |
+          ./build/kvlog-server --port 6399 --no-log 2>/dev/null &
+          for i in $(seq 1 50); do redis-cli -p 6399 PING >/dev/null 2>&1 && break; sleep 0.1; done
+          test "$(redis-cli -p 6399 SET greeting hello)" = "OK"
+          test "$(redis-cli -p 6399 GET greeting)" = "hello"
+          test "$(redis-cli -p 6399 DEL greeting nothing)" = "1"
+          redis-cli -p 6399 SET k v >/dev/null && test "$(redis-cli -p 6399 EXISTS k)" = "1"
+          kill %1
       - name: Run
         run: |
-          nproc
+          echo "runner vCPUs: $(nproc)"
           bash bench/run_vs_redis.sh build/kvlog-bench build/kvlog-server | tee results.jsonl
       - name: Summary
         run: |

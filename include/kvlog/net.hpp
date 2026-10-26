@@ -10,6 +10,9 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
 using socket_t = SOCKET;
@@ -17,6 +20,7 @@ inline constexpr socket_t kBadSocket = INVALID_SOCKET;
 inline void close_socket(socket_t s) { ::closesocket(s); }
 #else
 #include <arpa/inet.h>
+#include <cerrno>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
@@ -76,10 +80,25 @@ inline socket_t connect_to(const std::string& host, std::uint16_t port) {
     return s;
 }
 
+#ifdef MSG_NOSIGNAL
+inline constexpr int kSendFlags = MSG_NOSIGNAL;  // a vanished peer must not raise SIGPIPE and kill the server
+#else
+inline constexpr int kSendFlags = 0;
+#endif
+
+inline bool interrupted() {
+#ifdef _WIN32
+    return false;
+#else
+    return errno == EINTR;
+#endif
+}
+
 // Sends all of `data`; false if the peer went away.
 inline bool send_all(socket_t s, std::string_view data) {
     while (!data.empty()) {
-        const int n = ::send(s, data.data(), static_cast<int>(data.size() > (1 << 30) ? (1 << 30) : data.size()), 0);
+        const int n = ::send(s, data.data(), static_cast<int>(data.size() > (1 << 30) ? (1 << 30) : data.size()), kSendFlags);
+        if (n < 0 && interrupted()) continue;
         if (n <= 0) return false;
         data.remove_prefix(static_cast<std::size_t>(n));
     }
@@ -88,8 +107,11 @@ inline bool send_all(socket_t s, std::string_view data) {
 
 // Receives up to `cap` bytes; 0 on orderly close or error.
 inline int recv_some(socket_t s, char* buf, int cap) {
-    const int n = ::recv(s, buf, cap, 0);
-    return n < 0 ? 0 : n;
+    for (;;) {
+        const int n = ::recv(s, buf, cap, 0);
+        if (n < 0 && interrupted()) continue;
+        return n < 0 ? 0 : n;
+    }
 }
 
 }  // namespace kvlog::net

@@ -110,6 +110,7 @@ int main(int argc, char** argv) {
     net::Init sockets;
     std::vector<std::vector<double>> lat(static_cast<std::size_t>(o.clients));
     std::atomic<long> failures{0};
+    std::atomic<long long> completed{0};
     std::vector<std::thread> threads;
     const auto start = Clock::now();
     for (int c = 0; c < o.clients; ++c) {
@@ -135,6 +136,7 @@ int main(int argc, char** argv) {
                     if (!net::send_all(s, batch) || !reader.read(n)) { ++failures; break; }
                     mine.push_back(std::chrono::duration<double, std::micro>(Clock::now() - t0).count());
                     sent += n;
+                    completed += n;
                 }
                 close_socket(s);
             } catch (const std::exception& e) {
@@ -147,7 +149,7 @@ int main(int argc, char** argv) {
     const double secs = std::chrono::duration<double>(Clock::now() - start).count();
     std::vector<double> all;
     for (auto& v : lat) all.insert(all.end(), v.begin(), v.end());
-    const double ops = static_cast<double>(o.clients) * static_cast<double>(o.requests) / secs;
+    const double ops = static_cast<double>(completed.load()) / secs;  // only requests that got a reply
     std::printf("{\"label\":\"%s\",\"clients\":%d,\"pipeline\":%d,\"requests_per_client\":%ld,\"set_ratio\":%.2f,"
                 "\"value_size\":%d,\"seconds\":%.3f,\"ops_per_sec\":%.0f,\"p50_us\":%.1f,\"p99_us\":%.1f,\"p999_us\":%.1f,"
                 "\"failures\":%ld}\n",

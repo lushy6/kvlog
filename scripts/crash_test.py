@@ -16,6 +16,7 @@ Standard library only.
 from __future__ import annotations
 
 import argparse
+import shutil
 import os
 import random
 import socket
@@ -86,17 +87,24 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
+DATA_LOST = 3  # the only exit code that means "acknowledged writes were lost"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--server", required=True)
     ap.add_argument("--rounds", type=int, default=20)
     ap.add_argument("--clients", type=int, default=8)
     ap.add_argument("--seed", type=int, default=7)
-    ap.add_argument("--fsync", default="always", help="server policy; 'no' is expected to FAIL (negative control)")
+    ap.add_argument("--fsync", default="always")
+    ap.add_argument("--unsafe", action="store_true",
+                    help="negative control: server replies before writing; this run is expected to LOSE data (exit 3)")
     args = ap.parse_args()
     rng = random.Random(args.seed)
 
     workdir = tempfile.mkdtemp(prefix="kvlog-crash-")
+    server_cmd = lambda port: [args.server, "--port", str(port), "--log", log, "--fsync", args.fsync] + (
+        ["--unsafe-reply-before-write"] if args.unsafe else [])
     log = os.path.join(workdir, "crash.aof")
     acked: dict[str, str] = {}      # key -> last acknowledged value
     inflight: dict[str, str] = {}   # key -> value sent but not acknowledged when the server died (at most one per client)
@@ -106,7 +114,7 @@ def main() -> int:
 
     for rnd in range(args.rounds):
         port = free_port()
-        proc = subprocess.Popen([args.server, "--port", str(port), "--log", log, "--fsync", args.fsync],
+        proc = subprocess.Popen(server_cmd(port),
                                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         wait_for_port(port, proc)
 
@@ -131,7 +139,7 @@ def main() -> int:
             for k, want, got, hist in detail:
                 print(f"  {k}: acknowledged {want!r}, server has {got!r}, last acks {hist}")
             print("  server said:", proc.stderr.read().decode().strip() if proc.stderr is not None else "")
-            return 1
+            return DATA_LOST
 
         # 2) Write until killed.
         stop = threading.Event()
@@ -156,7 +164,19 @@ def main() -> int:
             except (OSError, ConnectionError):
                 pass  # the server was killed mid-request: this write is not acknowledged
 
+        def compactor() -> None:
+            # Every third round also rewrites the log continuously, so some kills land mid-COMPACT.
+            try:
+                c = Conn(port)
+                while not stop.is_set():
+                    c.call("COMPACT")
+                    time.sleep(0.02)
+            except (OSError, ConnectionError):
+                pass
+
         threads = [threading.Thread(target=writer, args=(c,), daemon=True) for c in range(args.clients)]
+        if rnd % 3 == 2:
+            threads.append(threading.Thread(target=compactor, daemon=True))
         for t in threads:
             t.start()
         time.sleep(rng.uniform(0.05, 0.6))
@@ -169,7 +189,7 @@ def main() -> int:
 
     # Final check after the last kill.
     port = free_port()
-    proc = subprocess.Popen([args.server, "--port", str(port), "--log", log, "--fsync", args.fsync],
+    proc = subprocess.Popen(server_cmd(port),
                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     wait_for_port(port, proc)
     reader = Conn(port)
@@ -183,9 +203,10 @@ def main() -> int:
     recovery_line = proc.stderr.read().decode().strip().splitlines()[0] if proc.stderr is not None else ""
     if lost:
         print(f"FAIL: {len(lost)} of {len(acked)} acknowledged keys lost or stale, e.g. {lost[:3]}")
-        return 1
+        return DATA_LOST
     print(f"PASS: {args.rounds} kills, {total_acked} acknowledged writes, all {len(acked)} keys intact")
     print(f"last restart: {recovery_line}")
+    shutil.rmtree(workdir, ignore_errors=True)
     return 0
 
 
