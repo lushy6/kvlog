@@ -65,29 +65,35 @@ The workflow in `.github/workflows/ci.yml` runs all of this on Ubuntu and Window
 in three matching modes (memory only; AOF `everysec`; AOF `always`). CI runs it on a GitHub-hosted Ubuntu
 runner with Redis 7.0.15 from apt.
 
-First CI run (commit `f293e95`, 2 vCPUs shared by both servers' threads and the 16 client threads; one run,
-so treat differences under about 20% as noise):
+CI run for commit `61ecfff` (GitHub-hosted runner; the first run's runner reported 2 vCPUs, shared by both
+servers and the 16 client threads). The `always` mode ran three rounds; the other modes ran once. Runners
+differ between CI runs (this run was about 35% faster than the first for both servers), so compare servers
+only within a run.
 
 | Mode | Pipeline | kvlog ops/s | Redis ops/s | kvlog p50 / p99 | Redis p50 / p99 |
 |---|---:|---:|---:|---:|---:|
-| memory only, 50/50 | 1 | 57,890 | 56,194 | 245 / 881 µs | 274 / 483 µs |
-| memory only, 50/50 | 16 | 545,636 | 444,287 | 386 / 1,391 µs | 525 / 958 µs |
-| `everysec`, 50/50 | 1 | 54,732 | 54,454 | 266 / 844 µs | 282 / 493 µs |
-| `everysec`, 50/50 | 16 | 449,624 | 383,701 | 484 / 1,922 µs | 598 / 1,252 µs |
-| `always`, all SET | 1 | 11,893 | 23,394 | 1,222 / 4,266 µs | 590 / 1,395 µs |
-| `always`, all SET | 16 | 157,263 | 204,084 | 1,464 / 3,929 µs | 1,220 / 2,911 µs |
+| memory only, 50/50 | 1 | 78,573 | 79,788 | 164 / 599 µs | 193 / 336 µs |
+| memory only, 50/50 | 16 | 763,100 | 567,962 | 275 / 1,085 µs | 406 / 784 µs |
+| `everysec`, 50/50 | 1 | 75,173 | 75,701 | 184 / 733 µs | 202 / 364 µs |
+| `everysec`, 50/50 | 16 | 596,542 | 480,310 | 363 / 1,592 µs | 483 / 974 µs |
+| `always`, all SET, 3 rounds | 1 | 13,809 – 14,977 | 26,706 – 31,352 | about 910 µs p50 | about 425 µs p50 |
+| `always`, all SET, 3 rounds | 16 | 128,540 – 216,411 | 214,482 – 263,705 | | |
 
 What this says:
 
-- **Without fsync on the hot path, kvlog keeps up with Redis on throughput** (about equal unpipelined, ahead
-  by 17–23% pipelined) **but has worse tail latency** (p99 about 1.5–1.8x Redis's). One thread per connection
-  on 2 vCPUs means more context switches than Redis's single event loop.
-- **Under `always`, Redis is faster: about 2x unpipelined and 1.3x pipelined.** Both group-commit, so the gap
-  is in the sync itself and its scheduling. Likely contributors, not measured separately: kvlog calls `fsync`
-  where Redis on Linux calls `fdatasync` (which skips metadata), and kvlog's fsync runs from a connection
-  thread rather than an event loop that keeps accepting work.
-- These numbers are from one run on shared CI hardware. They show the order of magnitude and the direction
-  of each gap, not a precise ratio.
+- **Without fsync on the hot path, kvlog keeps up with Redis on throughput** (equal unpipelined, 24–34% ahead
+  pipelined) **but has worse tail latency** (p99 1.4–2.0x Redis's). One thread per connection on a small
+  runner means more context switches than Redis's single event loop. The first CI run (commit `f293e95`)
+  showed the same pattern.
+- **Under `always`, Redis is about 2x faster unpipelined**, in every round of both CI runs. Pipelined, the
+  rounds are too noisy to rank (kvlog's range overlaps Redis's).
+- **`fsync` versus `fdatasync` is not the cause.** Redis uses `fdatasync`, so kvlog switched to it on Linux and
+  the benchmark ran a second kvlog build that still uses `fsync`, in the same rounds. Unpipelined:
+  `fdatasync` 13,809 – 14,977 SET/s, `fsync` 14,252 – 15,686. No measurable difference; the change is kept
+  because it matches Redis and is equally durable for an append-only file (`fdatasync` still flushes the size).
+- **Where the 2x is, untested:** kvlog's median write takes about twice Redis's. One explanation to measure
+  next is how long a write waits for an fsync that is already running before its own can start, and the
+  wake-up cost of the waiting connection threads. Until that is measured, the cause is open.
 
 Local Windows run, kvlog only (24-thread desktop, Redis not installed):
 
@@ -101,8 +107,8 @@ Local Windows run, kvlog only (24-thread desktop, Redis not installed):
 Pipelining under `always` is 20x faster because the whole batch shares one fsync.
 
 **Known differences in this comparison:** kvlog is multi-threaded and Redis (with default `io-threads 1`)
-is single-threaded, on a runner with 2 vCPUs that the 16 client threads also use; kvlog calls `fsync` where
-Redis on Linux calls `fdatasync`. A follow-up worth measuring: switch to `fdatasync` on Linux and re-run.
+is single-threaded, on a small runner that the 16 client threads also use. Both now sync the log with
+`fdatasync` on Linux.
 
 ## Design decisions and limitations
 
