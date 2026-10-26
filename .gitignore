@@ -1,0 +1,4 @@
+build/
+*.aof
+*.aof.rewrite
+__pycache__/

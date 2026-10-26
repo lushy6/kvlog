@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Build, unit tests, crash test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Configure and build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release
+      - name: Unit tests
+        run: ctest --test-dir build -C Release --output-on-failure
+      - name: Locate server binary
+        shell: bash
+        run: |
+          bin=$(find build -name 'kvlog-server' -o -name 'kvlog-server.exe' | head -1)
+          echo "SERVER=$(cd "$(dirname "$bin")" && pwd)/$(basename "$bin")" >> "$GITHUB_ENV"
+      - name: Crash test, fsync=always (must keep every acknowledged write)
+        shell: bash
+        run: python scripts/crash_test.py --server "$SERVER" --rounds 20
+      - name: Negative control, fsync=no (must lose acknowledged writes, or the crash test proves nothing)
+        shell: bash
+        run: |
+          if python scripts/crash_test.py --server "$SERVER" --rounds 10 --fsync no; then
+            echo "::error::the crash test passed without durability; it is not detecting data loss"
+            exit 1
+          fi
+          echo "negative control failed as expected"
+
+  bench:
+    name: Benchmark vs Redis (same runner, same client)
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Redis
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq redis-server && redis-server --version
+      - name: Build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build
+      - name: Run
+        run: |
+          nproc
+          bash bench/run_vs_redis.sh build/kvlog-bench build/kvlog-server | tee results.jsonl
+      - name: Summary
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          rows = [json.loads(l) for l in open("results.jsonl") if l.startswith("{")]
+          print("| server/mode | pipeline | ops/s | p50 µs | p99 µs | failures |\n|---|---:|---:|---:|---:|---:|")
+          for r in rows:
+              print(f"| {r['label']} | {r['pipeline']} | {r['ops_per_sec']:,.0f} | {r['p50_us']:.0f} | {r['p99_us']:.0f} | {r['failures']} |")
+          EOF
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: results.jsonl
