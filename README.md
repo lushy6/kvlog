@@ -55,15 +55,39 @@ build to fail (`test_store_broken_must_fail`), so the claim is re-checked on eve
 | `scripts/crash_test.py` | Starts the real server, runs 8 writer clients (and in every third round a client running `COMPACT` continuously), kills the process without warning (SIGKILL / TerminateProcess) at a random moment, restarts it, and checks every acknowledged write. A write in flight when the process died may or may not survive. Local Windows run, `--fsync always`: 20 kills, 26,181 acknowledged writes, all 2,400 keys intact; `everysec` and `no` also pass. |
 | Negative control | `--unsafe-reply-before-write` (a test-only server flag) replies before writing; the crash test must then report data loss with its dedicated exit code 3, not just any failure. Locally it lost 777 acknowledged keys in round 1. |
 
-The workflow in `.github/workflows/ci.yml` runs all of this on Ubuntu and Windows. **It has not run yet:** the
-repository has no remote so far.
+The workflow in `.github/workflows/ci.yml` runs all of this on Ubuntu and Windows; the first run (commit
+`f293e95`, 2026-10-26) passed on both, including the crash test and its negative control.
 
 ## Benchmark vs Redis
 
 `bench/run_vs_redis.sh` runs both servers on one machine with the same `kvlog-bench` client: 16 connections,
 50% SET / 50% GET over 100,000 keys with 64-byte values (the `always` mode is 100% SET), pipeline 1 and 16,
 in three matching modes (memory only; AOF `everysec`; AOF `always`). CI runs it on a GitHub-hosted Ubuntu
-runner. **No Redis numbers yet**, because CI has not run; none are claimed here.
+runner with Redis 7.0.15 from apt.
+
+First CI run (commit `f293e95`, 2 vCPUs shared by both servers' threads and the 16 client threads; one run,
+so treat differences under about 20% as noise):
+
+| Mode | Pipeline | kvlog ops/s | Redis ops/s | kvlog p50 / p99 | Redis p50 / p99 |
+|---|---:|---:|---:|---:|---:|
+| memory only, 50/50 | 1 | 57,890 | 56,194 | 245 / 881 µs | 274 / 483 µs |
+| memory only, 50/50 | 16 | 545,636 | 444,287 | 386 / 1,391 µs | 525 / 958 µs |
+| `everysec`, 50/50 | 1 | 54,732 | 54,454 | 266 / 844 µs | 282 / 493 µs |
+| `everysec`, 50/50 | 16 | 449,624 | 383,701 | 484 / 1,922 µs | 598 / 1,252 µs |
+| `always`, all SET | 1 | 11,893 | 23,394 | 1,222 / 4,266 µs | 590 / 1,395 µs |
+| `always`, all SET | 16 | 157,263 | 204,084 | 1,464 / 3,929 µs | 1,220 / 2,911 µs |
+
+What this says:
+
+- **Without fsync on the hot path, kvlog keeps up with Redis on throughput** (about equal unpipelined, ahead
+  by 17–23% pipelined) **but has worse tail latency** (p99 about 1.5–1.8x Redis's). One thread per connection
+  on 2 vCPUs means more context switches than Redis's single event loop.
+- **Under `always`, Redis is faster: about 2x unpipelined and 1.3x pipelined.** Both group-commit, so the gap
+  is in the sync itself and its scheduling. Likely contributors, not measured separately: kvlog calls `fsync`
+  where Redis on Linux calls `fdatasync` (which skips metadata), and kvlog's fsync runs from a connection
+  thread rather than an event loop that keeps accepting work.
+- These numbers are from one run on shared CI hardware. They show the order of magnitude and the direction
+  of each gap, not a precise ratio.
 
 Local Windows run, kvlog only (24-thread desktop, Redis not installed):
 
@@ -76,9 +100,9 @@ Local Windows run, kvlog only (24-thread desktop, Redis not installed):
 
 Pipelining under `always` is 20x faster because the whole batch shares one fsync.
 
-**Known differences that the comparison must state when it has numbers:** kvlog is multi-threaded and Redis
-(with default `io-threads 1`) is single-threaded, on a runner with 4 vCPUs that the 16 client threads also use;
-kvlog calls `fsync` where Redis on Linux calls `fdatasync`.
+**Known differences in this comparison:** kvlog is multi-threaded and Redis (with default `io-threads 1`)
+is single-threaded, on a runner with 2 vCPUs that the 16 client threads also use; kvlog calls `fsync` where
+Redis on Linux calls `fdatasync`. A follow-up worth measuring: switch to `fdatasync` on Linux and re-run.
 
 ## Design decisions and limitations
 

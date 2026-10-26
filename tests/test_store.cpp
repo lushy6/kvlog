@@ -72,7 +72,7 @@ static void replay_reproduces_memory_under_contention(SyncPolicy policy, int thr
     fs::remove(p);
 }
 
-static void compaction_during_writes_loses_nothing() {
+[[maybe_unused]] static void compaction_during_writes_loses_nothing() {  // unused in the ORDERING_ONLY build
     const fs::path p = "compact.aof";
     fs::remove(p);
     std::map<std::string, std::string> live;
@@ -105,7 +105,7 @@ static void compaction_during_writes_loses_nothing() {
     fs::remove(p);
 }
 
-static void delete_of_missing_key_writes_nothing() {
+[[maybe_unused]] static void delete_of_missing_key_writes_nothing() {  // unused in the ORDERING_ONLY build
     const fs::path p = "del.aof";
     fs::remove(p);
     {
