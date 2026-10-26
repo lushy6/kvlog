@@ -75,7 +75,7 @@ jobs:
       - name: Run
         run: |
           echo "runner vCPUs: $(nproc)"
-          bash bench/run_vs_redis.sh build/kvlog-bench build/kvlog-server | tee results.jsonl
+          bash bench/run_vs_redis.sh build/kvlog-bench build/kvlog-server build/kvlog-server-fsync | tee results.jsonl
       - name: Summary
         run: |
           python3 - <<'EOF' >> "$GITHUB_STEP_SUMMARY"

@@ -200,9 +200,14 @@ inline bool flush_and_sync(std::FILE* f) {
 #endif
 }
 
+// The log's hot-path sync. On Linux fdatasync is enough for an append-only file: it still flushes the
+// metadata needed to read the data back (the file size), and skips the rest (timestamps), as Redis does.
+// Building with KVLOG_SYNC_WITH_FSYNC keeps plain fsync so the benchmark can compare the two.
 inline bool sync_fd_of(std::FILE* f) {
 #ifdef _WIN32
     return _commit(_fileno(f)) == 0;
+#elif defined(__linux__) && !defined(KVLOG_SYNC_WITH_FSYNC)
+    return ::fdatasync(::fileno(f)) == 0;
 #else
     return ::fsync(::fileno(f)) == 0;
 #endif

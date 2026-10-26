@@ -22,6 +22,10 @@ endif()
 
 add_executable(kvlog-server src/server.cpp)
 target_link_libraries(kvlog-server PRIVATE kvlog)
+# Same server with plain fsync instead of fdatasync on the log's hot path, for the benchmark's A/B row.
+add_executable(kvlog-server-fsync src/server.cpp)
+target_link_libraries(kvlog-server-fsync PRIVATE kvlog)
+target_compile_definitions(kvlog-server-fsync PRIVATE KVLOG_SYNC_WITH_FSYNC)
 add_executable(kvlog-bench src/bench.cpp)
 target_link_libraries(kvlog-bench PRIVATE kvlog)
 
